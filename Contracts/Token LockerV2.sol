@@ -24,7 +24,7 @@ interface IERC20 {
     event Approval( address indexed owner, address indexed spender, uint256 value);
 }
 
-contract TokenLocker is Context {
+contract TokenLockerV2 is Context {
     struct LockStruct {
         IERC20 token;
         address beneficiary;
@@ -37,35 +37,61 @@ contract TokenLocker is Context {
 
     LockStruct[] private locker;
 
-    /**
-     * @dev Get Lock Info by ID.
-     */
     function getLockInfo(uint256 lockID) public view returns (IERC20 token, address beneficiary, uint256 amount, uint256 releaseTimestamp, bool isActive) { 
         return (locker[lockID].token, locker[lockID].beneficiary, locker[lockID].amount, locker[lockID].releaseTimestamp, locker[lockID].isActive);
     }
+    function getLockerLength() public view returns (uint256) { 
+        return locker.length;
+    }
 
-    function getIDByBeneficiary(address beneficiary, uint256 number) public view returns (uint256) {
-        return beneficiaryIDs[beneficiary][number];
+    function getIDByBeneficiary(address beneficiary, uint256 index) public view returns (uint256) {
+        return beneficiaryIDs[beneficiary][index];
+    }
+
+    function getInfoByBeneficiary(address beneficiary, IERC20 token) public view returns (uint256 TotalActiveLocks, uint256 TotalHeld, uint256 TotalUnlocked) {
+        uint256 totalActiveLocks; uint256 totalLocked; uint256 totalUnlocked;
+
+        for (uint256 i = 0; i < beneficiaryIDs[beneficiary].length; i++) {
+            uint256 lockID = beneficiaryIDs[beneficiary][i];
+            if (locker[lockID].isActive && locker[lockID].token == token) {
+                totalActiveLocks++;
+                totalLocked = totalLocked + locker[lockID].amount;
+                if (block.timestamp >= locker[lockID].releaseTimestamp)
+                    totalUnlocked = totalUnlocked + locker[lockID].amount;
+            }
+        }
+        return (totalActiveLocks, totalLocked, totalUnlocked);
     }
 
     function lockToken (IERC20 token, address beneficiary, uint256 amount, uint256 releaseTimestamp) public {
         require(releaseTimestamp > block.timestamp, "TokenTimelock: release time is before current time");
 
-        LockStruct memory newLock = LockStruct({
-            token: token,
-            beneficiary: beneficiary,
-            amount: amount,
-            releaseTimestamp: releaseTimestamp,
-            isActive: true
-        });
-        locker.push(newLock);
+        bool isLockAlreadyCreated = false; uint256 lockID;
+        for (uint256 i = 0; i < beneficiaryIDs[beneficiary].length; i++) {
+            lockID = beneficiaryIDs[beneficiary][i];
+            if (locker[lockID].isActive && locker[lockID].token == token && locker[lockID].releaseTimestamp == releaseTimestamp)
+                isLockAlreadyCreated = true;
+        }
+        if (isLockAlreadyCreated)
+            increaseLockAmount(lockID, amount);
+        else {
+            LockStruct memory newLock = LockStruct({
+                token: token,
+                beneficiary: beneficiary,
+                amount: amount,
+                releaseTimestamp: releaseTimestamp,
+                isActive: true
+            });
+            locker.push(newLock);
 
-        beneficiaryIDs[beneficiary].push(locker.length - 1);
+            beneficiaryIDs[beneficiary].push(locker.length - 1);
 
-        token.transferFrom(beneficiary, address(this), amount);
+            token.transferFrom(_msgSender(), address(this), amount);
+        }
     }
 
     function extendLock(uint256 lockID, uint256 releaseTimestamp) public virtual {
+        require(locker[lockID].isActive, "TokenTimelock: lock ID is inactive.");
         require(_msgSender() == locker[lockID].beneficiary, "TokenTimelock: release time is before current lock.");
         require(releaseTimestamp > locker[lockID].releaseTimestamp, "TokenTimelock: release time is before current lock.");
 
@@ -73,7 +99,6 @@ contract TokenLocker is Context {
     }
 
     function increaseLockAmount(uint256 lockID, uint256 addAmount) public virtual {
-        require(_msgSender() == locker[lockID].beneficiary, "TokenTimelock: release time is before current lock.");
         require(locker[lockID].isActive, "TokenTimelock: lock ID is inactive.");
 
         locker[lockID].amount = locker[lockID].amount + addAmount;
@@ -81,9 +106,6 @@ contract TokenLocker is Context {
         locker[lockID].token.transferFrom(_msgSender(), address(this), addAmount);
     }
 
-    /**
-     * @notice Transfers tokens held by timelock to beneficiary.
-     */
     function release(uint256 lockID) public virtual {
         require(_msgSender() == locker[lockID].beneficiary, "TokenTimelock: release time is before current lock.");
         require(block.timestamp >= locker[lockID].releaseTimestamp, "TokenTimelock: current time is before release time.");
@@ -93,5 +115,17 @@ contract TokenLocker is Context {
 
         locker[lockID].amount = 0;
         locker[lockID].isActive = false;
+    }
+
+    function releaseAllUnlocked() public virtual {
+        for (uint256 i = 0; i < beneficiaryIDs[_msgSender()].length; i++) {
+            uint256 lockID = beneficiaryIDs[_msgSender()][i];
+            if (block.timestamp >= locker[lockID].releaseTimestamp && locker[lockID].amount > 0) {
+                locker[lockID].token.transfer(locker[lockID].beneficiary, locker[lockID].amount);
+
+                locker[lockID].amount = 0;
+                locker[lockID].isActive = false;
+            }
+        }
     }
 }
