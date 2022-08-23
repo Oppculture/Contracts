@@ -37,6 +37,10 @@ interface IERC20 {
     event Approval( address indexed owner, address indexed spender, uint256 value);
 }
 
+interface ILOCKER {
+    function lockToken (IERC20 token, address beneficiary, uint256 amount, uint256 releaseTimestamp) external;
+}
+
 /**
  * @dev Contract module which provides a basic access control mechanism, where
  * there is an account (an owner) that can be granted exclusive access to
@@ -140,14 +144,20 @@ interface CULTBurn {
     function burn(uint256 amount) external;
 }
 
-
-contract DistributorContract is Context, Ownable {
+contract DistributorContractV2 is Context, Ownable {
     using SafeMath for uint256;
  
     address public OppcultureContract = 0x3cdFC8dE85c094cA8d292feE269919E407ecDc1a;
     address public EquityContract = 0x14895D191C8c2BdE4c488BE84fdAe95339eabfa1;
+    address public TokenLockerContract = 0x14895D191C8c2BdE4c488BE84fdAe95339eabfa1;
+
+    mapping (address => bool) private EquityPools;
 
     address[] public equityHolders;
+
+    bool public autoTransfer = true;
+    bool public sendEquityEmissionsToVesting = false;
+    uint256 public equityVestingTimeStamp;
 
     address payable public OppcultureTreasury;
     address payable public InvestmentTreasury;
@@ -155,12 +165,20 @@ contract DistributorContract is Context, Ownable {
     uint256 public OppculturePercent = 60;
     uint256 public InvestmentPercent = 20;
     uint256 public ScrapPercent = 20;
- 
-    function SetOppcultureContract(address adr) public onlyOwner {
-        OppcultureContract = adr;
+
+    uint256 public CultForTreasury;
+
+    function IsEquityPool(address account) public view returns(bool) {
+        return EquityPools[account];
     }
-    function SetEquityContract(address adr) public onlyOwner {
-        EquityContract = adr;
+    function SetEquityPoolContract(address account, bool value) public onlyOwner {
+        EquityPools[account] = value;
+    }
+ 
+    function SetContracts(address oppcultureContract, address equityContract, address tokenLockerContract) public onlyOwner {
+        OppcultureContract = oppcultureContract;
+        EquityContract = equityContract;
+        TokenLockerContract = tokenLockerContract;
     }
 
     function SetWallets(address payable oppcultureTreasury, address payable investmentTreasury, address payable scrapTreasury) public onlyOwner {
@@ -181,28 +199,68 @@ contract DistributorContract is Context, Ownable {
         equityHolders = adrs;
     }
 
-    function withdrawCULT(uint256 percent) public onlyOwner {
-        uint256 amount = (IERC20(OppcultureContract).balanceOf(address(this)).mul(percent)).div(100);
+    function SetAutoTransfer(bool state) public onlyOwner {
+        autoTransfer = state;
+    }
+    function SetSendEquityEmissionsToVesting(bool state) public onlyOwner {
+        sendEquityEmissionsToVesting = state;
+    }
+    function SetEquityVestingTimeStamp(uint256 timestamp) public onlyOwner {
+        require(timestamp > block.timestamp, "TokenTimelock: release time is before current time");
+        equityVestingTimeStamp = timestamp;
+    }
 
-        IERC20(OppcultureContract).transfer(OppcultureTreasury, (amount.mul(90)).div(100) );
-    }
-    function withdrawCultToEquityHolders(uint256 amount) public onlyOwner {
-        for (uint256 i = 0; i < equityHolders.length; i++) {
-            IERC20(OppcultureContract).transfer(equityHolders[i], amount.mul( IERC20(EquityContract).balanceOf(equityHolders[i]) ).div(100 * 10**uint256(18)) );
-        }
-    }
-    
     function burn(uint256 amount) public onlyOwner {
+        uint256 amountAvailable = IERC20(OppcultureContract).balanceOf(address(this)).sub(CultForTreasury);
+        require(amount <= amountAvailable, "Can't burn treasuries stake.");
+
         CULTBurn(OppcultureContract).burn(amount);
     }
 
-    function withdrawETH(uint256 percent) public onlyOwner {
-        uint256 amount = address(this).balance.mul(percent).div(100);
+    function distributeCULT(bool withdrawToTreasury) public onlyOwner {
+        uint256 amount = IERC20(OppcultureContract).balanceOf(address(this)).sub(CultForTreasury);
+
+        CultForTreasury = CultForTreasury.add((amount.mul(90)).div(100));
+
+        if (amount != 0)
+            withdrawCultToEquityHolders(amount.div(10));
+
+        if (withdrawToTreasury)
+            withdrawCULT(100);
+    }
+
+    function withdrawCultToEquityHolders(uint256 amount) private {
+        for (uint256 i = 0; i < equityHolders.length; i++) {
+            address to = equityHolders[i];
+            if (EquityPools[to])
+                to = OppcultureTreasury;
+
+            if (sendEquityEmissionsToVesting) {
+                if (IERC20(OppcultureContract).allowance(address(this), TokenLockerContract) < 10**uint256(28))
+                    IERC20(OppcultureContract).approve(TokenLockerContract, 10**uint256(36));
+                ILOCKER(TokenLockerContract).lockToken(IERC20(OppcultureContract), to, amount.mul( IERC20(EquityContract).balanceOf(equityHolders[i]) ).div(100 * 10**uint256(18)), equityVestingTimeStamp);
+            } else
+                IERC20(OppcultureContract).transfer(to, amount.mul( IERC20(EquityContract).balanceOf(equityHolders[i]) ).div(100 * 10**uint256(18)) );
+        }
+    }
+    function withdrawCULT(uint256 percent) public onlyOwner {
+        uint256 amount = (CultForTreasury.mul(percent)).div(100);
+
+        CultForTreasury = CultForTreasury.sub(amount);
+
+        IERC20(OppcultureContract).transfer(OppcultureTreasury, amount);
+    }
+
+    function withdrawETH() public {
+        uint256 amount = address(this).balance;
 
         OppcultureTreasury.transfer(amount.mul(OppculturePercent).div(100));
         InvestmentTreasury.transfer(amount.mul(InvestmentPercent).div(100));
         ScrapTreasury.transfer(amount.mul(ScrapPercent).div(100));
     }
 
-    receive() external payable {}
+    receive() external payable {
+        if (autoTransfer)
+            withdrawETH();
+    }
 }
